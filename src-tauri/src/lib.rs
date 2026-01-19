@@ -1,10 +1,13 @@
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Window};
 use walkdir::WalkDir;
+use zip::ZipArchive;
 
 // 生成时间戳字符串 (格式: YYYYMMDD_HHMMSS)
 fn generate_timestamp() -> String {
@@ -59,10 +62,79 @@ pub struct SingleCompressResult {
     pub poster_path: Option<String>,
 }
 
+// FFmpeg 状态
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FFmpegStatus {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub path: Option<String>,
+}
+
+// FFmpeg 下载进度
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    pub total: u64,
+    pub percent: f64,
+}
+
 // 图片扩展名
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 // 视频扩展名
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "avi", "mkv", "webm"];
+
+// FFmpeg 下载地址 (macOS ARM64 静态构建)
+const FFMPEG_DOWNLOAD_URL: &str = "https://evermeet.cx/ffmpeg/getrelease/zip";
+
+// 获取 FFmpeg 存储目录
+fn get_ffmpeg_dir() -> Result<PathBuf, String> {
+    let data_dir = dirs::data_dir()
+        .ok_or("无法获取应用数据目录")?;
+    let ffmpeg_dir = data_dir.join("com.falcocut.compress-tool").join("bin");
+    Ok(ffmpeg_dir)
+}
+
+// 获取 FFmpeg 可执行文件路径
+fn get_ffmpeg_path() -> Option<PathBuf> {
+    // 1. 先检查应用数据目录
+    if let Ok(ffmpeg_dir) = get_ffmpeg_dir() {
+        let app_ffmpeg = ffmpeg_dir.join("ffmpeg");
+        if app_ffmpeg.exists() {
+            return Some(app_ffmpeg);
+        }
+    }
+
+    // 2. 检查系统 PATH
+    if let Ok(output) = Command::new("which").arg("ffmpeg").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+
+    None
+}
+
+// 获取 FFmpeg 版本
+fn get_ffmpeg_version(ffmpeg_path: &Path) -> Option<String> {
+    let output = Command::new(ffmpeg_path)
+        .arg("-version")
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let version_str = String::from_utf8_lossy(&output.stdout);
+        // 提取版本号，例如 "ffmpeg version 6.1 ..."
+        if let Some(line) = version_str.lines().next() {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
 
 fn get_file_type(path: &Path) -> &'static str {
     let ext = path
@@ -164,6 +236,120 @@ fn scan_file(path: String) -> Result<FileInfo, String> {
     do_scan_file(&path)
 }
 
+// 检查 FFmpeg 是否安装
+#[tauri::command]
+fn check_ffmpeg() -> FFmpegStatus {
+    match get_ffmpeg_path() {
+        Some(path) => {
+            let version = get_ffmpeg_version(&path);
+            FFmpegStatus {
+                installed: true,
+                version,
+                path: Some(path.to_string_lossy().to_string()),
+            }
+        }
+        None => FFmpegStatus {
+            installed: false,
+            version: None,
+            path: None,
+        },
+    }
+}
+
+// 下载并安装 FFmpeg
+#[tauri::command]
+async fn download_ffmpeg(window: Window) -> Result<String, String> {
+    let ffmpeg_dir = get_ffmpeg_dir()?;
+
+    // 创建目录
+    fs::create_dir_all(&ffmpeg_dir).map_err(|e| format!("创建目录失败: {}", e))?;
+
+    // 下载文件
+    let client = reqwest::Client::new();
+    let response = client
+        .get(FFMPEG_DOWNLOAD_URL)
+        .send()
+        .await
+        .map_err(|e| format!("下载请求失败: {}", e))?;
+
+    let total_size = response.content_length().unwrap_or(0);
+    let zip_path = ffmpeg_dir.join("ffmpeg.zip");
+
+    // 创建文件
+    let mut file = File::create(&zip_path)
+        .map_err(|e| format!("创建文件失败: {}", e))?;
+
+    let mut downloaded: u64 = 0;
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("下载数据失败: {}", e))?;
+        file.write_all(&chunk)
+            .map_err(|e| format!("写入文件失败: {}", e))?;
+
+        downloaded += chunk.len() as u64;
+        let percent = if total_size > 0 {
+            (downloaded as f64 / total_size as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let _ = window.emit(
+            "ffmpeg-download-progress",
+            DownloadProgress {
+                downloaded,
+                total: total_size,
+                percent,
+            },
+        );
+    }
+
+    // 解压 ZIP 文件
+    let file = File::open(&zip_path)
+        .map_err(|e| format!("打开 ZIP 文件失败: {}", e))?;
+    let mut archive = ZipArchive::new(file)
+        .map_err(|e| format!("解析 ZIP 文件失败: {}", e))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)
+            .map_err(|e| format!("读取 ZIP 内容失败: {}", e))?;
+
+        let outpath = ffmpeg_dir.join(file.name());
+
+        if file.is_dir() {
+            fs::create_dir_all(&outpath)
+                .map_err(|e| format!("创建目录失败: {}", e))?;
+        } else {
+            if let Some(parent) = outpath.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建父目录失败: {}", e))?;
+            }
+            let mut outfile = File::create(&outpath)
+                .map_err(|e| format!("创建输出文件失败: {}", e))?;
+            std::io::copy(&mut file, &mut outfile)
+                .map_err(|e| format!("解压文件失败: {}", e))?;
+        }
+    }
+
+    // 删除 ZIP 文件
+    let _ = fs::remove_file(&zip_path);
+
+    // 设置可执行权限
+    let ffmpeg_path = ffmpeg_dir.join("ffmpeg");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&ffmpeg_path)
+            .map_err(|e| format!("获取文件权限失败: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&ffmpeg_path, perms)
+            .map_err(|e| format!("设置可执行权限失败: {}", e))?;
+    }
+
+    Ok(ffmpeg_path.to_string_lossy().to_string())
+}
+
 // 压缩图片 - 默认转 WebP，保持原格式时使用原扩展名
 fn compress_image(
     input: &Path,
@@ -189,6 +375,10 @@ fn compress_video(
     output: &Path,
     generate_poster: bool,
 ) -> Result<(u64, Option<String>), Box<dyn std::error::Error>> {
+    // 获取 FFmpeg 路径
+    let ffmpeg_path = get_ffmpeg_path()
+        .ok_or("FFmpeg 未安装，请先下载安装")?;
+
     // 保持原扩展名
     let ext = input.extension()
         .and_then(|e| e.to_str())
@@ -202,7 +392,7 @@ fn compress_video(
     // -c:a aac 音频编码
     // -c:s copy 复制字幕流
     // -c:t copy 复制附件流（封面等）
-    let status = Command::new("ffmpeg")
+    let status = Command::new(&ffmpeg_path)
         .args([
             "-i",
             input.to_str().unwrap(),
@@ -245,9 +435,13 @@ fn compress_video(
 
 // 提取视频封面
 fn extract_poster(input: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // 获取 FFmpeg 路径
+    let ffmpeg_path = get_ffmpeg_path()
+        .ok_or("FFmpeg 未安装")?;
+
     let temp_jpg = output.with_extension("jpg");
 
-    let status = Command::new("ffmpeg")
+    let status = Command::new(&ffmpeg_path)
         .args([
             "-i",
             input.to_str().unwrap(),
@@ -424,7 +618,9 @@ pub fn run() {
             scan_folder,
             scan_file,
             compress_folder,
-            compress_file
+            compress_file,
+            check_ffmpeg,
+            download_ffmpeg
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

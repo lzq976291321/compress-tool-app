@@ -7,9 +7,15 @@ import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import FileList from './components/FileList';
 import ProgressBar from './components/ProgressBar';
 import ResultPanel from './components/ResultPanel';
-import { FileInfo, ProgressPayload, CompressResult, SingleCompressResult, AppStatus, InputMode } from './types';
+import { FileInfo, ProgressPayload, CompressResult, SingleCompressResult, AppStatus, InputMode, FFmpegStatus, DownloadProgress } from './types';
 
 function App() {
+  // FFmpeg 状态
+  const [ffmpegStatus, setFfmpegStatus] = useState<FFmpegStatus | null>(null);
+  const [ffmpegChecking, setFfmpegChecking] = useState(true);
+  const [ffmpegDownloading, setFfmpegDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
+
   const [status, setStatus] = useState<AppStatus>('idle');
   const [inputMode, setInputMode] = useState<InputMode>('folder');
   const [inputPath, setInputPath] = useState<string | null>(null);
@@ -23,6 +29,51 @@ function App() {
   // 压缩选项
   const [imageToWebp, setImageToWebp] = useState(true);
   const [generatePoster, setGeneratePoster] = useState(true);
+
+  // 检查 FFmpeg
+  const checkFFmpeg = async () => {
+    setFfmpegChecking(true);
+    try {
+      const status = await invoke<FFmpegStatus>('check_ffmpeg');
+      setFfmpegStatus(status);
+    } catch (error) {
+      console.error('检查 FFmpeg 失败:', error);
+      setFfmpegStatus({ installed: false, version: null, path: null });
+    } finally {
+      setFfmpegChecking(false);
+    }
+  };
+
+  // 下载 FFmpeg
+  const handleDownloadFFmpeg = async () => {
+    setFfmpegDownloading(true);
+    setDownloadProgress({ downloaded: 0, total: 0, percent: 0 });
+    try {
+      await invoke('download_ffmpeg');
+      await checkFFmpeg();
+    } catch (error) {
+      console.error('下载 FFmpeg 失败:', error);
+      alert(`下载失败: ${error}`);
+    } finally {
+      setFfmpegDownloading(false);
+      setDownloadProgress(null);
+    }
+  };
+
+  // 启动时检查 FFmpeg
+  useEffect(() => {
+    checkFFmpeg();
+  }, []);
+
+  // 监听 FFmpeg 下载进度
+  useEffect(() => {
+    const unlisten = listen<DownloadProgress>('ffmpeg-download-progress', (event) => {
+      setDownloadProgress(event.payload);
+    });
+    return () => {
+      unlisten.then(fn => fn());
+    };
+  }, []);
 
   // 监听压缩进度
   useEffect(() => {
@@ -189,6 +240,69 @@ function App() {
   const hasImage = inputMode === 'file'
     ? singleFile?.fileType === 'image'
     : files.some(f => f.fileType === 'image');
+
+  // 格式化下载大小
+  const formatDownloadSize = (bytes: number) => {
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  // FFmpeg 初始化界面
+  if (ffmpegChecking) {
+    return (
+      <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
+        <div className="text-center">
+          <div className="text-5xl mb-4 animate-pulse">⚙️</div>
+          <p className="text-gray-400">正在检查环境...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!ffmpegStatus?.installed) {
+    return (
+      <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center p-8">
+        <div className="max-w-md w-full text-center">
+          <div className="text-6xl mb-6">🎬</div>
+          <h1 className="text-2xl font-bold mb-4">需要安装 FFmpeg</h1>
+          <p className="text-gray-400 mb-6">
+            视频压缩功能需要 FFmpeg 支持。点击下方按钮自动下载安装（约 80MB）。
+          </p>
+
+          {ffmpegDownloading ? (
+            <div className="space-y-4">
+              <div className="bg-gray-800 rounded-full h-3 overflow-hidden">
+                <div
+                  className="bg-blue-500 h-full transition-all duration-300"
+                  style={{ width: `${downloadProgress?.percent || 0}%` }}
+                />
+              </div>
+              <p className="text-gray-400 text-sm">
+                {downloadProgress && (
+                  <>
+                    {formatDownloadSize(downloadProgress.downloaded)} / {formatDownloadSize(downloadProgress.total)}
+                    <span className="ml-2">({downloadProgress.percent.toFixed(1)}%)</span>
+                  </>
+                )}
+              </p>
+              <p className="text-gray-500 text-xs">正在下载 FFmpeg，请稍候...</p>
+            </div>
+          ) : (
+            <button
+              onClick={handleDownloadFFmpeg}
+              className="px-8 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors"
+            >
+              下载并安装 FFmpeg
+            </button>
+          )}
+
+          <p className="text-gray-600 text-xs mt-6">
+            FFmpeg 将安装到应用数据目录，不会影响系统
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-8">

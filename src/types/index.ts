@@ -35,3 +35,15 @@ export interface CompressOptions {
   imageToWebp: boolean;
   generatePoster: boolean;
 }
+
+export interface FFmpegStatus {
+  installed: boolean;
+  version: string | null;
+  path: string | null;
+}
+
+export interface DownloadProgress {
+  downloaded: number;
+  total: number;
+  percent: number;
+}
