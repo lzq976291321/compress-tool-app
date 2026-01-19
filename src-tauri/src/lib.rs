@@ -96,6 +96,14 @@ fn get_ffmpeg_dir() -> Result<PathBuf, String> {
     Ok(ffmpeg_dir)
 }
 
+// 常见的 FFmpeg 安装路径
+const COMMON_FFMPEG_PATHS: &[&str] = &[
+    "/opt/homebrew/bin/ffmpeg",      // macOS ARM Homebrew
+    "/usr/local/bin/ffmpeg",          // macOS Intel Homebrew
+    "/usr/bin/ffmpeg",                // 系统安装
+    "/opt/local/bin/ffmpeg",          // MacPorts
+];
+
 // 获取 FFmpeg 可执行文件路径
 fn get_ffmpeg_path() -> Option<PathBuf> {
     // 1. 先检查应用数据目录
@@ -106,7 +114,15 @@ fn get_ffmpeg_path() -> Option<PathBuf> {
         }
     }
 
-    // 2. 检查系统 PATH
+    // 2. 检查常见安装路径（打包后的应用 PATH 可能不完整）
+    for path in COMMON_FFMPEG_PATHS {
+        let ffmpeg_path = Path::new(path);
+        if ffmpeg_path.exists() {
+            return Some(ffmpeg_path.to_path_buf());
+        }
+    }
+
+    // 3. 最后尝试 which 命令（开发环境）
     if let Ok(output) = Command::new("which").arg("ffmpeg").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
